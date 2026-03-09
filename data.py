@@ -92,26 +92,50 @@ def fetch_prices(
         raise
 
     # --- Extract close prices from potentially MultiIndex DataFrame ---
+    # yfinance >= 0.2.31 swapped MultiIndex order from (field, ticker)
+    # to (ticker, field). We detect which schema is in use and handle both.
     price_col = "Close"  # auto_adjust=True renames Adj Close -> Close
 
     if isinstance(raw.columns, pd.MultiIndex):
-        try:
-            prices = raw[price_col]
-        except KeyError:
-            available = raw.columns.get_level_values(0).unique().tolist()
-            logger.warning("Column '%s' not found. Available: %s", price_col, available)
-            prices = raw[available[0]]
-    else:
-        prices = raw[[price_col]].rename(columns={price_col: tickers[0]})
+        level_0 = raw.columns.get_level_values(0).unique().tolist()
+        level_1 = raw.columns.get_level_values(1).unique().tolist()
 
+        if price_col in level_0:
+            # Old schema: (field, ticker)
+            prices = raw[price_col]
+        elif price_col in level_1:
+            # New schema: (ticker, field)
+            prices = raw.xs(price_col, axis=1, level=1)
+        else:
+            # Fallback: use first available field
+            logger.warning(
+                "Column '%s' not found. level_0=%s  level_1=%s",
+                price_col, level_0, level_1,
+            )
+            fallback = level_1[0] if level_1 else level_0[0]
+            prices = raw.xs(fallback, axis=1, level=1)
+    else:
+        # Single ticker or flat columns
+        if price_col in raw.columns:
+            prices = raw[[price_col]].rename(columns={price_col: tickers[0]})
+        else:
+            close_cols = [c for c in raw.columns if "close" in str(c).lower()]
+            col = close_cols[0] if close_cols else raw.columns[0]
+            logger.warning("Expected '%s', using '%s' instead.", price_col, col)
+            prices = raw[[col]].rename(columns={col: tickers[0]})
+
+    # Ensure columns are plain strings
     prices.columns = [str(c) for c in prices.columns]
 
+    # Drop tickers that are entirely NaN (e.g. bad symbols)
     before = prices.shape[1]
     prices.dropna(axis=1, how="all", inplace=True)
     dropped = before - prices.shape[1]
     if dropped:
         logger.warning("Dropped %d all-NaN tickers after download.", dropped)
 
+    # Forward-fill small gaps (weekends / holidays already handled by yf,
+    # but crypto may have isolated NaNs mid-series)
     prices.ffill(inplace=True)
     prices.dropna(how="all", inplace=True)
 
@@ -123,7 +147,19 @@ def fetch_prices(
 
 
 def fetch_latest(tickers: List[str]) -> pd.DataFrame:
-    """Fetch the last 100 calendar days of daily prices."""
+    """Fetch the last 100 calendar days of daily prices.
+
+    Convenience wrapper used by paper-trading and live-alert modules
+    where only recent data is needed.
+
+    Parameters
+    ----------
+    tickers : list of ticker symbols
+
+    Returns
+    -------
+    pd.DataFrame  same shape as fetch_prices()
+    """
     logger.info("fetch_latest: pulling 100-day window for %d tickers", len(tickers))
     return fetch_prices(tickers, period="100d", interval="1d")
 
@@ -133,7 +169,16 @@ def fetch_latest(tickers: List[str]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Compute daily percentage returns from a prices DataFrame."""
+    """Compute daily percentage returns from a prices DataFrame.
+
+    Parameters
+    ----------
+    prices : pd.DataFrame  price series (columns = tickers)
+
+    Returns
+    -------
+    pd.DataFrame  of daily pct_change values; first row is NaN and is dropped
+    """
     returns = prices.pct_change()
     returns.dropna(how="all", inplace=True)
     logger.debug("Returns shape: %s", returns.shape)
